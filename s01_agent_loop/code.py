@@ -6,7 +6,7 @@ The entire secret of an AI coding agent in one pattern:
 
     while True:
         response = LLM(messages, tools)
-        if response contains no tool_use:
+        if response contains no function_call:
             break
         execute tools
         append results
@@ -16,7 +16,7 @@ The entire secret of an AI coding agent in one pattern:
     |  prompt  |      |       |      | execute |
     +----------+      +---+---+      +----+----+
                           ^               |
-                          |   tool_result |
+                          | function_call_output |
                           +---------------+
                           (loop continues)
 
@@ -25,10 +25,11 @@ until the model decides to stop. Later chapters add policy,
 hooks, and lifecycle controls around it.
 
 Usage:
-    pip install anthropic python-dotenv
-    ANTHROPIC_API_KEY=... python s01_agent_loop/code.py
+    pip install openai python-dotenv
+    OPENAI_BASE_URL=http://127.0.0.1:4142/v1 python s01_agent_loop/code.py
 """
 
+import json
 import os
 import subprocess
 
@@ -42,33 +43,36 @@ try:
 except ImportError:
     pass
 
-from anthropic import Anthropic
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
-
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+client = OpenAI(
+    api_key=os.getenv("OPENAI_API_KEY", "copilot-bridge"),
+    base_url=os.getenv("OPENAI_BASE_URL"),
+)
 MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Act, don't explain."
 
 # -- Tool definition: just bash --
 TOOLS = [{
+    "type": "function",
     "name": "bash",
     "description": "Run a shell command.",
-    "input_schema": {
+    "parameters": {
         "type": "object",
         "properties": {"command": {"type": "string"}},
         "required": ["command"],
+        "additionalProperties": False,
     },
 }]
 
 
 # -- Tool execution --
 def run_bash(command: str) -> str:
+    """Run one shell command and return bounded combined output."""
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
@@ -84,37 +88,45 @@ def run_bash(command: str) -> str:
 
 
 # -- The core pattern: a while loop that calls tools until the model stops --
-def agent_loop(messages: list):
+def agent_loop(items: list) -> str:
+    """Keep calling the model and its tools until no function call remains."""
     while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
+        response = client.responses.create(
+            model=MODEL,
+            instructions=SYSTEM,
+            input=items,
+            tools=TOOLS,
+            max_output_tokens=8000,
         )
 
-        # Append assistant turn
-        messages.append({"role": "assistant", "content": response.content})
+        # Keep every output item, including reasoning, for the next turn.
+        items.extend(response.output)
 
         # If the model didn't call a tool, we're done
         tool_calls = [
-            block for block in response.content if block.type == "tool_use"
+            item for item in response.output if item.type == "function_call"
         ]
         if not tool_calls:
-            return
+            return response.output_text
 
         # Execute each tool call, collect results
         results = []
-        for block in tool_calls:
-            print(f"\033[33m$ {block.input['command']}\033[0m")
-            output = run_bash(block.input["command"])
+        for call in tool_calls:
+            # Responses API serializes function arguments as JSON text.
+            arguments = json.loads(call.arguments)
+            command = arguments["command"]
+            print(f"\033[33m$ {command}\033[0m")
+            output = run_bash(command)
             print(output[:200])
             results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": output,
+                "type": "function_call_output",
+                # call_id pairs this result with the model's original request.
+                "call_id": call.call_id,
+                "output": output,
             })
 
         # Feed tool results back, loop continues
-        messages.append({"role": "user", "content": results})
+        items.extend(results)
 
 
 # -- Entry point --
@@ -132,11 +144,5 @@ if __name__ == "__main__":
         if query.strip().lower() in ("q", "exit", ""):
             break
         history.append({"role": "user", "content": query})
-        agent_loop(history)
-        # Print the model's final text response
-        response_content = history[-1]["content"]
-        if isinstance(response_content, list):
-            for block in response_content:
-                if getattr(block, "type", None) == "text":
-                    print(block.text)
+        print(agent_loop(history))
         print()
