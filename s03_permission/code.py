@@ -17,20 +17,21 @@ Three gates inserted before tool execution:
                           |                 | deny                 |
                           |                 v                      v
                           |          +-------------------------------+
-                          +----------+ tool_result: denied or output |
+                          +-------+ function_call_output: denied or output |
                                      +-------------------------------+
 
 Only one line added to the agent loop:
 
-    if not check_permission(block):
+    if not check_permission(tool_name, arguments):
         continue
 
 Builds on s02 (multi-tool). Usage:
 
     python s03_permission/code.py
-    Needs: pip install anthropic python-dotenv + ANTHROPIC_API_KEY in .env
+    Needs: pip install openai python-dotenv + OPENAI_API_KEY in .env
 """
 
+import json
 import os
 import re
 import subprocess
@@ -45,15 +46,16 @@ try:
 except ImportError:
     pass
 
-from anthropic import Anthropic
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+client = OpenAI(
+    api_key=os.getenv("OPENAI_API_KEY", "copilot-bridge"),
+    base_url=os.getenv("OPENAI_BASE_URL"),
+)
 MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. All destructive operations require user approval."
@@ -62,6 +64,7 @@ SYSTEM = f"You are a coding agent at {WORKDIR}. All destructive operations requi
 # -- From s02: tool implementations --
 
 def run_bash(command: str) -> str:
+    """Run one shell command and return bounded combined output."""
     try:
         r = subprocess.run(command, shell=True, cwd=WORKDIR,
                            capture_output=True, text=True, errors="replace", timeout=120)
@@ -72,6 +75,7 @@ def run_bash(command: str) -> str:
 
 
 def run_read(path: str, limit: int | None = None) -> str:
+    """Read a UTF-8 file, optionally limiting the returned line count."""
     try:
         lines = (WORKDIR / path).resolve().read_text(encoding="utf-8").splitlines()
         if limit and limit < len(lines):
@@ -82,6 +86,7 @@ def run_read(path: str, limit: int | None = None) -> str:
 
 
 def run_write(path: str, content: str) -> str:
+    """Write UTF-8 content to a file, creating parent directories."""
     try:
         file_path = (WORKDIR / path).resolve()
         file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -92,6 +97,7 @@ def run_write(path: str, content: str) -> str:
 
 
 def run_edit(path: str, old_text: str, new_text: str) -> str:
+    """Replace the first exact text match in a UTF-8 file."""
     try:
         file_path = (WORKDIR / path).resolve()
         text = file_path.read_text(encoding="utf-8")
@@ -104,6 +110,7 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
 
 
 def run_glob(pattern: str) -> str:
+    """Return up to 200 workspace files matching a glob pattern."""
     import glob as g
     try:
         matches = sorted({
@@ -122,16 +129,16 @@ def run_glob(pattern: str) -> str:
 # -- From s02 (unchanged): tool definitions and dispatch --
 
 TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to a file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text in a file once.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
-    {"name": "glob", "description": "Find files matching a glob pattern; ** matches recursively.",
-     "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
+    {"type": "function", "name": "bash", "description": "Run a shell command.",
+     "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"], "additionalProperties": False}},
+    {"type": "function", "name": "read_file", "description": "Read file contents.",
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"], "additionalProperties": False}},
+    {"type": "function", "name": "write_file", "description": "Write content to a file.",
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"], "additionalProperties": False}},
+    {"type": "function", "name": "edit_file", "description": "Replace exact text in a file once.",
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"], "additionalProperties": False}},
+    {"type": "function", "name": "glob", "description": "Find files matching a glob pattern; ** matches recursively.",
+     "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"], "additionalProperties": False}},
 ]
 
 TOOL_HANDLERS = {
@@ -146,6 +153,7 @@ TOOL_HANDLERS = {
 DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "> /dev/sda"]
 
 def check_deny_list(command: str) -> str | None:
+    """Return a blocking reason when a command is always forbidden."""
     for pattern in DENY_LIST:
         if pattern in command:
             return f"Blocked: '{pattern}' is on the deny list"
@@ -159,6 +167,7 @@ DESTRUCTIVE_COMMAND_WORD = re.compile(
 
 
 def contains_destructive_command(command: str) -> bool:
+    """Detect rm or del when used as an actual shell command word."""
     return bool(DESTRUCTIVE_COMMAND_WORD.search(command))
 
 
@@ -173,6 +182,7 @@ PERMISSION_RULES = [
 ]
 
 def check_rules(tool_name: str, args: dict) -> str | None:
+    """Return the first permission rule matched by a tool call."""
     for rule in PERMISSION_RULES:
         if tool_name in rule["tools"] and rule["check"](args):
             return rule["message"]
@@ -181,6 +191,7 @@ def check_rules(tool_name: str, args: dict) -> str | None:
 
 # Gate 3: User approval - wait for confirmation after rule match
 def ask_user(tool_name: str, args: dict, reason: str) -> str:
+    """Ask the user to allow or deny a rule-matched tool call."""
     print(f"\n\033[33m[permission] {reason}\033[0m")
     print(f"   Tool: {tool_name}({args})")
     choice = input("   Allow? [y/N] ").strip().lower()
@@ -188,15 +199,18 @@ def ask_user(tool_name: str, args: dict, reason: str) -> str:
 
 
 # Pipeline: all three gates chained
-def check_permission(block) -> bool:
-    if block.name == "bash":
-        reason = check_deny_list(block.input.get("command", ""))
+def check_permission(tool_name: str, args: dict) -> bool:
+    """Apply hard denial first, then rules that require user approval."""
+    # Gate 1 never prompts because deny-listed commands are always forbidden.
+    if tool_name == "bash":
+        reason = check_deny_list(args.get("command", ""))
         if reason:
             print(f"\n\033[31m[blocked] {reason}\033[0m")
             return False
-    reason = check_rules(block.name, block.input)
+    # Gates 2 and 3 turn a contextual rule match into a human decision.
+    reason = check_rules(tool_name, args)
     if reason:
-        decision = ask_user(block.name, block.input, reason)
+        decision = ask_user(tool_name, args, reason)
         if decision == "deny":
             return False
     return True
@@ -204,36 +218,45 @@ def check_permission(block) -> bool:
 
 # -- Agent loop: same as s02, with check_permission() inserted --
 
-def agent_loop(messages: list):
+def agent_loop(items: list) -> str:
+    """Run model turns, enforcing permissions before every tool call."""
     while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
+        response = client.responses.create(
+            model=MODEL,
+            instructions=SYSTEM,
+            input=items,
+            tools=TOOLS,
+            max_output_tokens=8000,
         )
-        messages.append({"role": "assistant", "content": response.content})
+        items.extend(response.output)
 
         tool_calls = [
-            block for block in response.content if block.type == "tool_use"
+            item for item in response.output if item.type == "function_call"
         ]
         if not tool_calls:
-            return
+            return response.output_text
 
         results = []
-        for block in tool_calls:
-            print(f"\033[36m> {block.name}\033[0m")
+        for call in tool_calls:
+            # Convert the API's JSON argument string before permission checks.
+            arguments = json.loads(call.arguments)
+            print(f"\033[36m> {call.name}\033[0m")
 
             # s03 change: run through permission pipeline before executing
-            if not check_permission(block):
-                results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": "Permission denied."})
+            if not check_permission(call.name, arguments):
+                results.append({"type": "function_call_output",
+                                # A denial is still a valid result for this call.
+                                "call_id": call.call_id,
+                                "output": "Permission denied."})
                 continue
 
-            handler = TOOL_HANDLERS.get(block.name)
-            output = handler(**block.input) if handler else f"Unknown: {block.name}"
+            handler = TOOL_HANDLERS.get(call.name)
+            output = handler(**arguments) if handler else f"Unknown: {call.name}"
             print(str(output)[:200])
-            results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
+            results.append({"type": "function_call_output",
+                            "call_id": call.call_id, "output": output})
 
-        messages.append({"role": "user", "content": results})
+        items.extend(results)
 
 
 if __name__ == "__main__":
@@ -250,8 +273,5 @@ if __name__ == "__main__":
         if query.strip().lower() in ("q", "exit", ""):
             break
         history.append({"role": "user", "content": query})
-        agent_loop(history)
-        for block in history[-1]["content"]:
-            if getattr(block, "type", None) == "text":
-                print(block.text)
+        print(agent_loop(history))
         print()
