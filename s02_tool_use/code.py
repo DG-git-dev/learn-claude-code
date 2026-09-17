@@ -21,6 +21,7 @@ and a dispatch map:
 Key insight: the loop stays the same; only tool registration and dispatch grow.
 """
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -34,15 +35,16 @@ try:
 except ImportError:
     pass
 
-from anthropic import Anthropic
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+client = OpenAI(
+    api_key=os.getenv("OPENAI_API_KEY", "copilot-bridge"),
+    base_url=os.getenv("OPENAI_BASE_URL"),
+)
 MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. Act, don't explain."
@@ -51,6 +53,7 @@ SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. Act, d
 # -- From s01 (unchanged) --
 
 def run_bash(command: str) -> str:
+    """Run one shell command and return bounded combined output."""
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
@@ -69,6 +72,7 @@ def run_bash(command: str) -> str:
 # -- New in s02: four tools --
 
 def safe_path(p: str) -> Path:
+    """Resolve a path and reject anything outside the workspace."""
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
@@ -76,6 +80,7 @@ def safe_path(p: str) -> Path:
 
 
 def run_read(path: str, limit: int | None = None) -> str:
+    """Read a UTF-8 file, optionally limiting the returned line count."""
     try:
         lines = safe_path(path).read_text(encoding="utf-8").splitlines()
         if limit and limit < len(lines):
@@ -86,6 +91,7 @@ def run_read(path: str, limit: int | None = None) -> str:
 
 
 def run_write(path: str, content: str) -> str:
+    """Write UTF-8 content to a workspace file, creating parents."""
     try:
         file_path = safe_path(path)
         file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -96,6 +102,7 @@ def run_write(path: str, content: str) -> str:
 
 
 def run_edit(path: str, old_text: str, new_text: str) -> str:
+    """Replace the first exact text match in a workspace file."""
     try:
         file_path = safe_path(path)
         text = file_path.read_text(encoding="utf-8")
@@ -108,6 +115,7 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
 
 
 def run_glob(pattern: str) -> str:
+    """Return up to 200 workspace files matching a glob pattern."""
     import glob as g
     try:
         matches = sorted({
@@ -126,16 +134,16 @@ def run_glob(pattern: str) -> str:
 # -- New in s02: tool definitions (one tool in s01, five in s02) --
 
 TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to a file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text in a file once.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
-    {"name": "glob", "description": "Find files matching a glob pattern; ** matches recursively.",
-     "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
+    {"type": "function", "name": "bash", "description": "Run a shell command.",
+     "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"], "additionalProperties": False}},
+    {"type": "function", "name": "read_file", "description": "Read file contents.",
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"], "additionalProperties": False}},
+    {"type": "function", "name": "write_file", "description": "Write content to a file.",
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"], "additionalProperties": False}},
+    {"type": "function", "name": "edit_file", "description": "Replace exact text in a file once.",
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"], "additionalProperties": False}},
+    {"type": "function", "name": "glob", "description": "Find files matching a glob pattern; ** matches recursively.",
+     "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"], "additionalProperties": False}},
 ]
 
 # -- New in s02: dispatch map (replaces s01's hard-coded run_bash call) --
@@ -147,32 +155,43 @@ TOOL_HANDLERS = {
 
 
 # -- The agent loop keeps the same shape as s01; only dispatch changes --
-# s01: output = run_bash(block.input["command"])
-# s02: output = TOOL_HANDLERS[block.name](**block.input)
+# s01: output = run_bash(arguments["command"])
+# s02: output = TOOL_HANDLERS[call.name](**arguments)
 
-def agent_loop(messages: list):
+def agent_loop(items: list) -> str:
+    """Run model turns and dispatch every requested function call."""
     while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
+        response = client.responses.create(
+            model=MODEL,
+            instructions=SYSTEM,
+            input=items,
+            tools=TOOLS,
+            max_output_tokens=8000,
         )
-        messages.append({"role": "assistant", "content": response.content})
+        items.extend(response.output)
 
         tool_calls = [
-            block for block in response.content if block.type == "tool_use"
+            item for item in response.output if item.type == "function_call"
         ]
         if not tool_calls:
-            return
+            return response.output_text
 
         results = []
-        for block in tool_calls:
-            print(f"\033[33m> {block.name}\033[0m")
-            handler = TOOL_HANDLERS.get(block.name)
-            output = handler(**block.input) if handler else f"Unknown: {block.name}"
+        for call in tool_calls:
+            # Responses API sends arguments as JSON; handlers expect kwargs.
+            arguments = json.loads(call.arguments)
+            print(f"\033[33m> {call.name}\033[0m")
+            handler = TOOL_HANDLERS.get(call.name)
+            output = handler(**arguments) if handler else f"Unknown: {call.name}"
             print(str(output)[:200])
-            results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
+            results.append({
+                "type": "function_call_output",
+                # Preserve call_id so the model can match request and result.
+                "call_id": call.call_id,
+                "output": output,
+            })
 
-        messages.append({"role": "user", "content": results})
+        items.extend(results)
 
 
 if __name__ == "__main__":
@@ -189,8 +208,5 @@ if __name__ == "__main__":
         if query.strip().lower() in ("q", "exit", ""):
             break
         history.append({"role": "user", "content": query})
-        agent_loop(history)
-        for block in history[-1]["content"]:
-            if getattr(block, "type", None) == "text":
-                print(block.text)
+        print(agent_loop(history))
         print()
