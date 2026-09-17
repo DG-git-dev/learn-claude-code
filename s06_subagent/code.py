@@ -2,13 +2,13 @@
 """
 s06_subagent.py - Subagents
 
-The task tool runs a second agent loop with a fresh message list. Both
+The task tool runs a second agent loop with a fresh input list. Both
 loops share the working directory, but only the final text returns to
 the parent conversation.
 
     Parent agent                    Subagent
     +------------------+            +------------------+
-    | messages=[...]   |            | messages=[prompt]|
+    | input=[...]      |            | input=[prompt]   |
     |                  |   task     |                  |
     | tool: task       | ---------> | own agent loop   |
     |                  |            | base tools only  |
@@ -18,6 +18,7 @@ the parent conversation.
 The subagent has no task tool, so it cannot delegate again.
 """
 
+import json
 import os
 import re
 import subprocess
@@ -26,21 +27,19 @@ from pathlib import Path
 try:
     import readline
     readline.parse_and_bind('set bind-tty-special-chars off')
-    readline.parse_and_bind('set input-meta on')
-    readline.parse_and_bind('set output-meta on')
-    readline.parse_and_bind('set convert-meta off')
 except ImportError:
     pass
 
-from anthropic import Anthropic
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+client = OpenAI(
+    api_key=os.getenv("OPENAI_API_KEY", "copilot-bridge"),
+    base_url=os.getenv("OPENAI_BASE_URL"),
+)
 MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = (
@@ -56,6 +55,7 @@ SUB_SYSTEM = (
 # -- Base tools --
 
 def run_bash(command: str) -> str:
+    """Run one shell command and return bounded combined output."""
     try:
         result = subprocess.run(
             command, shell=True, cwd=WORKDIR,
@@ -68,6 +68,7 @@ def run_bash(command: str) -> str:
 
 
 def run_read(path: str, limit: int | None = None) -> str:
+    """Read a UTF-8 file, optionally limiting the returned line count."""
     try:
         lines = (WORKDIR / path).resolve().read_text(encoding="utf-8").splitlines()
         if limit and limit < len(lines):
@@ -78,6 +79,7 @@ def run_read(path: str, limit: int | None = None) -> str:
 
 
 def run_write(path: str, content: str) -> str:
+    """Write UTF-8 content to a file, creating parent directories."""
     try:
         file_path = (WORKDIR / path).resolve()
         file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -88,6 +90,7 @@ def run_write(path: str, content: str) -> str:
 
 
 def run_edit(path: str, old_text: str, new_text: str) -> str:
+    """Replace the first exact text match in a UTF-8 file."""
     try:
         file_path = (WORKDIR / path).resolve()
         text = file_path.read_text(encoding="utf-8")
@@ -100,10 +103,11 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
 
 
 def run_glob(pattern: str) -> str:
-    import glob
+    """Return up to 200 workspace files matching a glob pattern."""
+    import glob as g
     try:
         matches = sorted({
-            match for match in glob.glob(
+            match for match in g.glob(
                 pattern, root_dir=WORKDIR, recursive=True)
             if (WORKDIR / match).resolve().is_relative_to(WORKDIR)
         })
@@ -116,16 +120,16 @@ def run_glob(pattern: str) -> str:
 
 
 BASE_TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to a file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text in a file once.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
-    {"name": "glob", "description": "Find files matching a glob pattern; ** matches recursively.",
-     "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
+    {"type": "function", "name": "bash", "description": "Run a shell command.",
+     "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"], "additionalProperties": False}},
+    {"type": "function", "name": "read_file", "description": "Read file contents.",
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"], "additionalProperties": False}},
+    {"type": "function", "name": "write_file", "description": "Write content to a file.",
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"], "additionalProperties": False}},
+    {"type": "function", "name": "edit_file", "description": "Replace exact text in a file once.",
+     "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"], "additionalProperties": False}},
+    {"type": "function", "name": "glob", "description": "Find files matching a glob pattern; ** matches recursively.",
+     "parameters": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"], "additionalProperties": False}},
 ]
 
 BASE_HANDLERS = {
@@ -143,10 +147,12 @@ HOOKS = {"UserPromptSubmit": [], "PreToolUse": [], "PostToolUse": [], "Stop": []
 
 
 def register_hook(event: str, callback):
+    """Append a callback to an event's ordered hook list."""
     HOOKS[event].append(callback)
 
 
 def trigger_hooks(event: str, *args):
+    """Run callbacks in order and return the first blocking result."""
     for callback in HOOKS[event]:
         result = callback(*args)
         if result is not None:
@@ -162,13 +168,14 @@ DESTRUCTIVE = ["rm ", "> /etc/", "chmod 777"]
 
 
 def contains_destructive_command(command: str) -> bool:
+    """Detect rm or del when used as an actual shell command word."""
     return bool(DESTRUCTIVE_COMMAND_WORD.search(command))
 
 
-def permission_hook(block):
+def permission_hook(tool_name: str, arguments: dict):
     """PreToolUse: block denied operations and ask about risky ones."""
-    if block.name == "bash":
-        command = block.input.get("command", "")
+    if tool_name == "bash":
+        command = arguments.get("command", "")
         for pattern in DENY_LIST:
             if pattern in command:
                 print(f"\n\033[31m[blocked] '{pattern}'\033[0m")
@@ -177,33 +184,33 @@ def permission_hook(block):
             keyword in command for keyword in DESTRUCTIVE
         ):
             print("\n\033[33m[permission] Potentially destructive command\033[0m")
-            print(f"   Tool: {block.name}({block.input})")
+            print(f"   Tool: {tool_name}({arguments})")
             choice = input("   Allow? [y/N] ").strip().lower()
             if choice not in ("y", "yes"):
                 return "Permission denied by user"
 
-    if block.name in ("read_file", "write_file", "edit_file"):
-        path = block.input.get("path", "")
+    if tool_name in ("read_file", "write_file", "edit_file"):
+        path = arguments.get("path", "")
         if not (WORKDIR / path).resolve().is_relative_to(WORKDIR):
             print("\n\033[33m[permission] Access outside workspace\033[0m")
-            print(f"   Tool: {block.name}({block.input})")
+            print(f"   Tool: {tool_name}({arguments})")
             choice = input("   Allow? [y/N] ").strip().lower()
             if choice not in ("y", "yes"):
                 return "Permission denied by user"
     return None
 
 
-def log_hook(block):
+def log_hook(tool_name: str, arguments: dict):
     """PreToolUse: log every tool call."""
-    args_preview = str(list(block.input.values())[:2])[:60]
-    print(f"\033[90m[HOOK] {block.name}({args_preview})\033[0m")
+    args_preview = str(list(arguments.values())[:2])[:60]
+    print(f"\033[90m[HOOK] {tool_name}({args_preview})\033[0m")
     return None
 
 
-def large_output_hook(block, output):
+def large_output_hook(tool_name: str, arguments: dict, output):
     """PostToolUse: warn on large output."""
     if len(str(output)) > 100000:
-        print(f"\033[33m[HOOK] Large output from {block.name}: {len(str(output))} chars\033[0m")
+        print(f"\033[33m[HOOK] Large output from {tool_name}: {len(str(output))} chars\033[0m")
     return None
 
 
@@ -213,17 +220,13 @@ def context_inject_hook(query: str):
     return None
 
 
-def summary_hook(messages: list):
-    """Stop: print the number of tool results in this message list."""
+def summary_hook(items: list):
+    """Stop: print the number of function results in this input list."""
+    # Input dictionaries and typed SDK items coexist in a Responses input list.
     tool_count = sum(
-        1
-        for message in messages
-        for block in (
-            message.get("content")
-            if isinstance(message.get("content"), list)
-            else []
-        )
-        if isinstance(block, dict) and block.get("type") == "tool_result"
+        1 for item in items
+        if (item.get("type") if isinstance(item, dict)
+            else getattr(item, "type", None)) == "function_call_output"
     )
     print(f"\033[90m[HOOK] Stop: session used {tool_count} tool calls\033[0m")
     return None
@@ -236,84 +239,83 @@ register_hook("PostToolUse", large_output_hook)
 register_hook("Stop", summary_hook)
 
 
-def execute_tool(block, handlers: dict) -> str:
-    blocked = trigger_hooks("PreToolUse", block)
+def execute_tool(call, handlers: dict) -> str:
+    """Decode and execute one Responses function call through shared hooks."""
+    # Responses function arguments arrive as serialized JSON text.
+    arguments = json.loads(call.arguments)
+    blocked = trigger_hooks("PreToolUse", call.name, arguments)
     if blocked:
         return str(blocked)
 
-    handler = handlers.get(block.name)
+    handler = handlers.get(call.name)
     try:
-        output = handler(**block.input) if handler else f"Unknown: {block.name}"
+        output = handler(**arguments) if handler else f"Unknown: {call.name}"
     except Exception as e:
         output = f"Error: {e}"
 
-    trigger_hooks("PostToolUse", block, output)
+    trigger_hooks("PostToolUse", call.name, arguments, output)
     return str(output)
 
 
-# -- New in s06: a nested agent loop with fresh messages --
+# -- New in s06: a nested agent loop with fresh input --
 
+# A child gets the kernel tools but cannot recursively delegate.
 SUB_TOOLS = list(BASE_TOOLS)
 SUB_HANDLERS = dict(BASE_HANDLERS)
 
 
-def extract_text(content) -> str:
-    if not isinstance(content, list):
-        return str(content)
-    return "\n".join(
-        getattr(block, "text", "")
-        for block in content
-        if getattr(block, "type", None) == "text"
-    )
-
-
 def run_subagent(prompt: str) -> str:
+    """Run a fresh child context and return only its final text."""
     print("\n\033[35m[Subagent started]\033[0m")
-    messages = [{"role": "user", "content": prompt}]
+    # Parent history is intentionally absent from this new input list.
+    items = [{"role": "user", "content": prompt}]
 
     for _ in range(30):
-        response = client.messages.create(
+        response = client.responses.create(
             model=MODEL,
-            system=SUB_SYSTEM,
-            messages=messages,
+            instructions=SUB_SYSTEM,
+            input=items,
             tools=SUB_TOOLS,
-            max_tokens=8000,
+            max_output_tokens=8000,
         )
-        messages.append({"role": "assistant", "content": response.content})
+        items.extend(response.output)
 
         tool_calls = [
-            block for block in response.content if block.type == "tool_use"
+            item for item in response.output if item.type == "function_call"
         ]
         if not tool_calls:
-            force = trigger_hooks("Stop", messages)
+            force = trigger_hooks("Stop", items)
             if force:
-                messages.append({"role": "user", "content": force})
+                items.append({"role": "user", "content": force})
                 continue
             print("\033[35m[Subagent done]\033[0m")
-            return extract_text(response.content) or "(no summary)"
+            # Only this summary crosses back into the parent's context.
+            return response.output_text or "(no summary)"
 
         results = []
-        for block in tool_calls:
-            output = execute_tool(block, SUB_HANDLERS)
-            print(f"  \033[90m[sub] {block.name}: {output[:100]}\033[0m")
+        for call in tool_calls:
+            output = execute_tool(call, SUB_HANDLERS)
+            print(f"  \033[90m[sub] {call.name}: {output[:100]}\033[0m")
             results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": output,
+                "type": "function_call_output",
+                "call_id": call.call_id,
+                "output": output,
             })
-        messages.append({"role": "user", "content": results})
+        items.extend(results)
 
     print("\033[35m[Subagent stopped]\033[0m")
     return "Subagent stopped after 30 turns without a final answer."
 
 
 TASK_TOOL = {
+    "type": "function",
     "name": "task",
     "description": "Run a subagent with fresh conversation context and return its final text.",
-    "input_schema": {
+    "parameters": {
         "type": "object",
         "properties": {"prompt": {"type": "string", "minLength": 1}},
         "required": ["prompt"],
+        "additionalProperties": False,
     },
 }
 
@@ -323,36 +325,37 @@ TOOL_HANDLERS = {**BASE_HANDLERS, "task": run_subagent}
 
 # -- Parent agent loop --
 
-def agent_loop(messages: list):
+def agent_loop(items: list) -> str:
+    """Run the parent loop and return its final response text."""
     while True:
-        response = client.messages.create(
+        response = client.responses.create(
             model=MODEL,
-            system=SYSTEM,
-            messages=messages,
+            instructions=SYSTEM,
+            input=items,
             tools=TOOLS,
-            max_tokens=8000,
+            max_output_tokens=8000,
         )
-        messages.append({"role": "assistant", "content": response.content})
+        items.extend(response.output)
 
         tool_calls = [
-            block for block in response.content if block.type == "tool_use"
+            item for item in response.output if item.type == "function_call"
         ]
         if not tool_calls:
-            force = trigger_hooks("Stop", messages)
+            force = trigger_hooks("Stop", items)
             if force:
-                messages.append({"role": "user", "content": force})
+                items.append({"role": "user", "content": force})
                 continue
-            return
+            return response.output_text
 
         results = []
-        for block in tool_calls:
-            output = execute_tool(block, TOOL_HANDLERS)
+        for call in tool_calls:
+            output = execute_tool(call, TOOL_HANDLERS)
             results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": output,
+                "type": "function_call_output",
+                "call_id": call.call_id,
+                "output": output,
             })
-        messages.append({"role": "user", "content": results})
+        items.extend(results)
 
 
 if __name__ == "__main__":
@@ -370,8 +373,5 @@ if __name__ == "__main__":
             break
         trigger_hooks("UserPromptSubmit", query)
         history.append({"role": "user", "content": query})
-        agent_loop(history)
-        for block in history[-1]["content"]:
-            if getattr(block, "type", None) == "text":
-                print(block.text)
+        print(agent_loop(history))
         print()
